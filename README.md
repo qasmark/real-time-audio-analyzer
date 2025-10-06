@@ -58,4 +58,5 @@ The application is built on a multi-threaded architecture to prevent UI blocking
 
 ## Demo
 
+![Demo_GUI](demo.png)
  
