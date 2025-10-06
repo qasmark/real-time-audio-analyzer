@@ -2,74 +2,84 @@ import numpy as np
 import sounddevice as sd
 import queue
 import threading
+import time
+import csv
+from PyQt5.QtCore import QObject, pyqtSignal
 from scipy.fft import rfft, rfftfreq
-from scipy.io import wavfile
+from collections import deque
 
 
-class AudioAnalyzer:
-    """
-    Класс для захвата и анализа аудиосигнала в отдельном потоке.
-    """
-    def __init__(self, device_name, sample_rate=44100, buffer_size=2048):
-        self.device_name = device_name
+class AudioAnalyzer(QObject):
+    status_changed = pyqtSignal(str)
+    new_data = pyqtSignal(float, float)
+
+    def __init__(self, sample_rate=44100, buffer_size=2048):
+        super().__init__()
         self.sample_rate = sample_rate
         self.buffer_size = buffer_size
         self.channels = 1
+        self.device_id = None
 
         self.audio_queue = queue.Queue()
         self.is_running = False
         self._thread = None
         self._stream = None
 
-        self._lock = threading.Lock()
-        self.latest_amplitude = 0.0
-        self.latest_frequency = 0.0
+        # 2. Заменяем list на deque с максимальной длиной
+        # Рассчитаем примерный размер на 5 минут записи
+        # (44100 / 2048) -> ~21.5 раз в секунду
+        # 22 * 60 * 5 -> 6600
+        # Возьмем с запасом, например, 100000 записей
+        self.history = deque(maxlen=100000)
+
+        self.start_time = 0
+
+    def set_device(self, device_id):
+        self.device_id = device_id
+        print(f"Выбрано устройство: {device_id}")
 
     def _audio_callback(self, indata, frames, time, status):
-        """Callback-функция для sounddevice. Вызывается в потоке аудио."""
         if status:
-            print(status)
+            self.status_changed.emit(f"Ошибка потока: {status}")
         self.audio_queue.put(indata.copy())
 
     def _processing_loop(self):
-        """Основной цикл обработки данных из очереди. Работает в self._thread."""
         while self.is_running:
             try:
                 audio_data = self.audio_queue.get(timeout=1)
-
                 audio_data = audio_data.flatten()
+
                 amplitude = np.sqrt(np.mean(audio_data ** 2))
 
                 windowed_data = audio_data * np.hanning(len(audio_data))
                 yf = rfft(windowed_data)
                 xf = rfftfreq(len(audio_data), 1 / self.sample_rate)
                 idx = np.argmax(np.abs(yf[1:])) + 1
-                frequency = xf[idx]
+                frequency = xf[idx] if amplitude > 0.0001 else 0.0
 
-                with self._lock:
-                    self.latest_amplitude = amplitude
-                    self.latest_frequency = frequency
+                timestamp = time.time() - self.start_time
+                self.history.append((timestamp, amplitude, frequency))
+                self.new_data.emit(amplitude, frequency)
 
             except queue.Empty:
                 continue
 
-    def get_latest_results(self):
-        """Возвращает последние вычисленные значения."""
-        with self._lock:
-            return self.latest_amplitude, self.latest_frequency
-
     def start(self):
-        """Запускает захват и анализ звука."""
         if self.is_running:
-            print("Анализатор уже запущен.")
+            self.status_changed.emit("Анализатор уже запущен.")
             return
 
-        print("Запуск анализатора...")
+        if self.device_id is None:
+            self.status_changed.emit("Ошибка: Аудио-устройство не выбрано!")
+            return
+
         self.is_running = True
+        self.history.clear()
+        self.start_time = time.time()
 
         try:
             self._stream = sd.InputStream(
-                device=self.device_name,
+                device=self.device_id,
                 channels=self.channels,
                 samplerate=self.sample_rate,
                 blocksize=self.buffer_size,
@@ -79,18 +89,16 @@ class AudioAnalyzer:
             self._stream.start()
             self._thread = threading.Thread(target=self._processing_loop)
             self._thread.start()
-            print("Анализатор успешно запущен.")
+            self.status_changed.emit(f"Анализ запущен на устройстве ID {self.device_id}")
         except Exception as e:
             self.is_running = False
-            print(f"Ошибка при запуске потока: {e}")
-            raise
+            self.status_changed.emit(f"Ошибка запуска: {e}")
 
     def stop(self):
-        """Останавливает захват и анализ."""
         if not self.is_running:
             return
 
-        print("Остановка анализатора...")
+        self.status_changed.emit("Остановка анализатора...")
         self.is_running = False
 
         if self._thread:
@@ -100,38 +108,35 @@ class AudioAnalyzer:
             self._stream.stop()
             self._stream.close()
 
-        # Очищаем очередь на случай, если там что-то осталось
         while not self.audio_queue.empty():
             self.audio_queue.get()
 
-        print("Анализатор остановлен.")
+        self.status_changed.emit("Остановлено.")
 
-    def process_file(self, file_path):
-        """Обрабатывает WAV-файл, эмулируя поток."""
-        if self.is_running:
-            self.stop()  # Останавливаем живой поток перед обработкой файла
+    def save_history(self, file_path):
+        if not self.history:
+            self.status_changed.emit("Нет данных для сохранения.")
+            return
+
         try:
-            samplerate, data = wavfile.read(file_path)
-            if data.dtype != np.float32:
-                data = data.astype(np.float32) / np.iinfo(data.dtype).max
-
-            if data.ndim > 1:
-                data = data[:, 0]
-
-            self.sample_rate = samplerate
-            print(f"Файл '{file_path}' загружен. Частота дискретизации: {samplerate} Гц.")
-
-            self.is_running = True
-            self._thread = threading.Thread(target=self._processing_loop)
-            self._thread.start()
-
-            for i in range(0, len(data), self.buffer_size):
-                chunk = data[i:i + self.buffer_size]
-                if len(chunk) < self.buffer_size:
-                    chunk = np.pad(chunk, (0, self.buffer_size - len(chunk)))
-                self.audio_queue.put(chunk)
-
-            print("Обработка файла завершена. Нажмите 'Стоп' для сброса.")
-
+            with open(file_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['timestamp_sec', 'amplitude_rms', 'frequency_hz'])
+                # 3. deque можно записывать точно так же, как и list
+                writer.writerows(self.history)
+            self.status_changed.emit(f"Анализ сохранен в {file_path}")
         except Exception as e:
-            print(f"Ошибка при обработке файла: {e}")
+            self.status_changed.emit(f"Ошибка сохранения файла: {e}")
+
+    def clear_history(self):
+        self.history.clear()
+        self.status_changed.emit("История и графики очищены.")
+
+    @staticmethod
+    def get_devices():
+        devices = sd.query_devices()
+        input_devices = []
+        for i, device in enumerate(devices):
+            if device['max_input_channels'] > 0:
+                input_devices.append({'id': i, 'name': device['name']})
+        return input_devices
